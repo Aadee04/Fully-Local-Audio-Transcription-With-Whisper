@@ -1,3 +1,6 @@
+# This script tests the sample rate of the default microphone input device.
+# It uses the sounddevice library to check if the device supports a specific sample rate.
+
 import sounddevice as sd
 
 # List all devices
