@@ -1,3 +1,5 @@
-openwakeword
-sounddevice
-tflite-runtime
+torch==2.1.0
+faster-whisper==0.0.20
+silero-vad==0.0.1
+picovoice==2.0.0
+numpy==1.24.0
