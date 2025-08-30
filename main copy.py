@@ -14,6 +14,8 @@ import time
 import threading
 from collections import deque
 import gc
+from langchain.prompts import PromptTemplate
+
 
 # ===== Detect device =====
 USE_CUDA = torch.cuda.is_available()
@@ -35,8 +37,8 @@ keyword_paths = ['models/Hey-Desktop_en_windows_v3_0_0.ppn']
 # ===== Model + VAD Config based on device =====
 if USE_CUDA:
     MODEL_SIZE = "large-v3"
-    BLOCK_DURATION = 5.0
-    SILENCE_TIMEOUT = 8.0
+    BLOCK_DURATION = 10.0
+    SILENCE_TIMEOUT = 12.0
     DEVICE = "cuda"
     COMPUTE_TYPE = "float16"
 else:
@@ -115,6 +117,10 @@ def process_audio_stream(model, buffer_queue, stop_event):
         if text:
             print(f"You said: {text}")
 
+            llm_output = query_llm(text)
+            print("LLM suggests the following code:")
+            print(llm_output)
+
         os.remove(wav_path)
 
 # ===== Run Whisper Session =====
@@ -151,6 +157,24 @@ def run_whisper_session():
             import gc
             gc.collect()
             print("Whisper model unloaded from memory.")
+
+
+# Initialize your LLM
+llm = ChatOpenAI(model_name="phi-3", temperature=0)
+
+def query_llm(transcribed_text, context=None):
+    # Optional context can be included
+    if context is None:
+        context = ""
+    
+    prompt = f"""
+    You are an assistant that converts user commands into Python code.
+    Context: {context}
+    User said: "{transcribed_text}"
+    Provide the Python code (do not execute it).
+    """
+    response = llm.predict(prompt)
+    return response
 
 
 # ===== Wake Word Listener =====

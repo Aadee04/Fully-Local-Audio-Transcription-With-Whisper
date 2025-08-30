@@ -3,25 +3,19 @@ import pyaudio
 import struct
 import torch
 import sys
-import contextlib
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
 import tempfile
 import os
-import soundfile as sf
+import soundfile as sf  # replaced ffmpeg subprocess with soundfile
 import time
 import threading
 from collections import deque
-import gc
 
-# ===== Detect device =====
-USE_CUDA = torch.cuda.is_available()
-
-# ===== CPU Optimization =====
-if not USE_CUDA:
-    os.environ["OMP_NUM_THREADS"] = str(os.cpu_count())
-    torch.set_num_threads(os.cpu_count())
+# ===== Set environment for optimal CPU performance =====
+os.environ["OMP_NUM_THREADS"] = str(os.cpu_count())  # Use all CPU cores
+torch.set_num_threads(os.cpu_count())               # PyTorch multithreading
 
 # ===== Wake Word Config =====
 try:
@@ -32,21 +26,11 @@ except ImportError:
 
 keyword_paths = ['models/Hey-Desktop_en_windows_v3_0_0.ppn']
 
-# ===== Model + VAD Config based on device =====
-if USE_CUDA:
-    MODEL_SIZE = "large-v3"
-    BLOCK_DURATION = 5.0
-    SILENCE_TIMEOUT = 8.0
-    DEVICE = "cuda"
-    COMPUTE_TYPE = "float16"
-else:
-    MODEL_SIZE = "base"
-    BLOCK_DURATION = 1.0
-    SILENCE_TIMEOUT = 5.0
-    DEVICE = "cpu"
-    COMPUTE_TYPE = "int8"
-
+# ===== Whisper + VAD Config =====
+MODEL_SIZE = "base"          # Smaller model for faster CPU inference
 SAMPLE_RATE = 16000
+BLOCK_DURATION = 1.0          # Smaller chunks for lower latency and memory use
+SILENCE_TIMEOUT = 5.0
 
 # ===== Load VAD =====
 vad_model, utils = torch.hub.load(
@@ -60,8 +44,7 @@ get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks = uti
 # ===== Wake Word Init =====
 porcupine = pvporcupine.create(
     access_key=ACCESS_KEY,
-    keyword_paths=keyword_paths,
-    sensitivities=[0.75]
+    keyword_paths=keyword_paths
 )
 pa = pyaudio.PyAudio()
 wake_stream = pa.open(
@@ -72,7 +55,6 @@ wake_stream = pa.open(
     frames_per_buffer=porcupine.frame_length
 )
 
-# ===== Audio Recording =====
 def record_audio_to_buffer(stop_event, buffer_queue):
     def audio_callback(indata, frames, time_info, status):
         if status:
@@ -85,7 +67,6 @@ def record_audio_to_buffer(stop_event, buffer_queue):
         while not stop_event.is_set():
             sd.sleep(50)
 
-# ===== Audio Processing =====
 def process_audio_stream(model, buffer_queue, stop_event):
     last_speech_time = time.time()
 
@@ -106,6 +87,7 @@ def process_audio_stream(model, buffer_queue, stop_event):
 
         last_speech_time = time.time()
 
+        # Use soundfile to write wav (faster and avoids subprocess overhead)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmpfile:
             wav_path = tmpfile.name
         sf.write(wav_path, audio_chunk, SAMPLE_RATE)
@@ -117,43 +99,29 @@ def process_audio_stream(model, buffer_queue, stop_event):
 
         os.remove(wav_path)
 
-# ===== Run Whisper Session =====
-def run_whisper_session():
+def run_whisper_session(model):
     print("Wake word detected! Starting session...")
+
     buffer_queue = deque()
     stop_event = threading.Event()
     record_thread = threading.Thread(target=record_audio_to_buffer, args=(stop_event, buffer_queue))
     record_thread.start()
 
-    model = None
-    try:
-        # Load model only when wake word is detected
-        model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
-        print(f"Model loaded on {DEVICE}.")
+    process_audio_stream(model, buffer_queue, stop_event)
 
-        process_audio_stream(model, buffer_queue, stop_event)
+    stop_event.set()
+    record_thread.join()
 
-    except KeyboardInterrupt:
-        print("CTRL+C detected. Exiting program...")
-        stop_event.set()
-        # Propagate KeyboardInterrupt to main loop
-        raise
+print("Loading Whisper model...")
+try:
+    model = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
+    print("Model loaded on CUDA.")
+except Exception as e:
+    print(f"CUDA not available or failed to load model on CUDA: {e}")
+    print("Falling back to CPU...")
+    model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")  # int8 for CPU optimization
+    print("Model loaded on CPU.")
 
-    except Exception as e:
-        print(f"Error during transcription: {e}")
-
-    finally:
-        stop_event.set()
-        record_thread.join()
-        # Remove model if it was successfully loaded
-        if model is not None:
-            del model
-            import gc
-            gc.collect()
-            print("Whisper model unloaded from memory.")
-
-
-# ===== Wake Word Listener =====
 print("Listening for wake word...")
 try:
     while True:
@@ -162,19 +130,13 @@ try:
         result = porcupine.process(pcm_unpacked)
 
         if result >= 0:
-            run_whisper_session()
+            run_whisper_session(model)
 
 except KeyboardInterrupt:
-    print("Stopping program...")
+    print("Stopping...")
 
 finally:
-    with contextlib.suppress(Exception):
-        if wake_stream.is_active():
-            wake_stream.stop_stream()
-    with contextlib.suppress(Exception):
-        wake_stream.close()
-    with contextlib.suppress(Exception):
-        pa.terminate()
-    with contextlib.suppress(Exception):
-        porcupine.delete()
-    print("Stopped.")
+    wake_stream.stop_stream()
+    wake_stream.close()
+    pa.terminate()
+    porcupine.delete()
